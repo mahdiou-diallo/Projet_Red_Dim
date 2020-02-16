@@ -292,19 +292,26 @@ class Trainer:
         self.l = l
         self.LLE = SparseLLE if sparse_lle else LLE
 
-    def train_model(self, track_W=False):
+    def train_model(self, track_W=False, track_Y=False):
         if track_W:
-            fig, ax = plt.subplots()
-            self.camera_ = Camera(fig)
+            w_fig, w_ax = plt.subplots()
+            self.w_camera_ = Camera(w_fig)
             r = r1svd.RankOneSvd()
         else:
-            self.camera_ = None
+            self.y_camera_ = None
+
+        if track_Y:
+            y_fig, y_ax = plt.subplots()
+            self.y_camera_ = Camera(y_fig)
+            r = r1svd.RankOneSvd()
+        else:
+            self.y_camera_ = None
 
         losses = []
         # loop over the dataset multiple times
         for epoch in tqdm(range(self.n_epochs)):
 
-            for inputs, _ in self.loader:
+            for inputs, labels in self.loader:
 
                 # encode
                 enc, dec = self.net(inputs)
@@ -315,7 +322,7 @@ class Trainer:
 
                 cost = self.criterion(inputs, enc, dec, torch.tensor(
                     S, dtype=torch.float),
-                    l=self.l if epoch <= self.n_epochs//3 else 1 + 1*(epoch - self.n_epochs))
+                    l=self.l if epoch <= 10 else 1 + .5*(epoch - 10))
             #     print(f"Loss:\t{cost.item():.3f}")
                 losses.append(cost.item())
 
@@ -326,10 +333,17 @@ class Trainer:
 
                 if track_W:
                     tmp = r.fit_transform(np.abs(S))
-                    ax.spy(tmp)
-                    self.camera_.snap()
+                    w_ax.spy(tmp)
+                    self.w_camera_.snap()
+                if track_Y:
+                    color = labels.detach().numpy().ravel()
+                    y_ax.scatter(X_enc[:, 0], X_enc[:, 1],
+                                 c=color, cmap='Set1')
+                    self.y_camera_.snap()
         if track_W:
-            plt.close(fig)
+            plt.close(w_fig)
+        if track_Y:
+            plt.close(y_fig)
 
         return losses
 

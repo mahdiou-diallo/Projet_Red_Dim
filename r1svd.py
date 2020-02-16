@@ -77,8 +77,8 @@ class RankOneSvd:
 
             it += 1
 
-        if it == self.max_iter:
-            print(f'did not converge in {self.max_iter} iterations')
+        # if it == self.max_iter:
+        #     print(f'did not converge in {self.max_iter} iterations')
         # print(f'Converged in {it} iterations.')
         # print('u = {u}\n v = {v}')
         self.u_ = u
