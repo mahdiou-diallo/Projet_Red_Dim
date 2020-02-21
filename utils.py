@@ -275,22 +275,64 @@ class SparseLLE:
         return self.S_, self.B_
 
 
+class LambdaScheduler:
+
+    def __init__(self, lambda_base=0, lambda_max=1, shift=0, scaling=1, method='sigmoid'):
+        self.shift = shift
+        self.scaling = scaling
+        self.lambda_base = lambda_base
+        self.lambda_max = lambda_max
+        self.iteration = 0
+        if method == 'sigmoid':
+            self.scheduler = self._sigmoid
+        elif method == 'unitstep':
+            self.scheduler = self._unitstep
+        elif method == 'const':
+            self.scheduler = self._constant
+        else:
+            raise ValueError(f"No scheduling method: {method!r}")
+
+    def _sigmoid(self, n):
+        """
+        sigmoid = l_min + L/(1+sc*e^(-n+n0))
+        """
+        return self.lambda_base + (self.lambda_max - self.lambda_base) / (1 + np.exp(-self.scaling * (n-self.shift)))
+
+    def _unitstep(self, n):
+        return self.lambda_base if n < self.shift else self.lambda_max
+
+    def _constant(self, n):
+        return self.lambda_max
+
+    def step(self):
+        self.iteration += 1
+
+    def get_l(self):
+        return self.scheduler(self.iteration)
+
+
 ##########################################################################
 # Model Trainer
 ##########################################################################
 
+
 class Trainer:
 
-    def __init__(self, net, loader, dataset, optimizer,
-                 n_epochs, n_neighbors=9, l=1, sparse_lle=False):
+    def __init__(self, net, loader, dataset, optimizer, n_epochs,
+                 n_neighbors=9, sparse_lle=False,
+                 lambda_scheduler=None, lambda_step='iter'):
         self.net = net
         self.loader = loader
         self.dataset = dataset
         self.optimizer = optimizer
         self.n_epochs = n_epochs
         self.n_neighbors = n_neighbors
-        self.l = l
         self.LLE = SparseLLE if sparse_lle else LLE
+        if lambda_scheduler is None:
+            self.lambda_scheduler = LambdaScheduler(method='constant')
+        else:
+            self.lambda_scheduler = lambda_scheduler
+        self.lambda_step = lambda_step
 
     def train_model(self, track_W=False, track_Y=False):
         if track_W:
@@ -307,7 +349,7 @@ class Trainer:
         else:
             self.y_camera_ = None
 
-        losses = []
+        self.losses = []
         # loop over the dataset multiple times
         for epoch in tqdm(range(self.n_epochs)):
 
@@ -320,16 +362,18 @@ class Trainer:
                 S, _ = self.LLE(self.n_neighbors,
                                 X_enc.shape[1]).fit_transform(X_enc)
 
-                cost = self.criterion(inputs, enc, dec, torch.tensor(
-                    S, dtype=torch.float),
-                    l=self.l if epoch <= 10 else 1 + .5*(epoch - 10))
+                cost = self.criterion(inputs, enc, dec,
+                                      torch.tensor(S, dtype=torch.float),
+                                      l=self.lambda_scheduler.get_l())
             #     print(f"Loss:\t{cost.item():.3f}")
-                losses.append(cost.item())
+                self.losses.append(cost.item())
 
                 # update autoencoder weights
                 self.optimizer.zero_grad()
                 cost.backward()
                 self.optimizer.step()
+                if self.lambda_step == 'iter':
+                    self.lambda_scheduler.step()
 
                 if track_W:
                     tmp = r.fit_transform(np.abs(S))
@@ -340,14 +384,16 @@ class Trainer:
                     y_ax.scatter(X_enc[:, 0], X_enc[:, 1],
                                  c=color, cmap='Set1')
                     self.y_camera_.snap()
+
+            if self.lambda_step == 'batch':
+                self.lambda_scheduler.step()
+
         if track_W:
             plt.close(w_fig)
         if track_Y:
             plt.close(y_fig)
 
-        return losses
-
-    def predict(self, loader):
+    def predict(self, loader, lle=True):
         with torch.no_grad():
             n = len(self.dataset)
             d_ae = self.net.d_latent
@@ -370,14 +416,24 @@ class Trainer:
                 if i == 0:
                     labels = labels.astype(out.dtype)
                 labels[s:e] = out
+            if lle:
+                S, Y = self.LLE(self.n_neighbors, d_ae).fit_transform(X_ae)
+                inp = torch.tensor(X, dtype=torch.float)
+                enc, dec = self.net(inp)
+                cost = Trainer.criterion(X, enc.numpy(), dec.numpy(), S,
+                                         l=self.lambda_scheduler.get_l())
+            else:
+                S = Y = None
+                cost = None
 
-            S, Y = self.LLE(self.n_neighbors, d_ae).fit_transform(X_ae)
-
-            inp = torch.tensor(X, dtype=torch.float)
-            enc, dec = self.net(inp)
-            cost = Trainer.criterion(X, enc.numpy(), dec.numpy(), S, l=self.l)
 #             Y = LocallyLinearEmbedding(self.n_neighbors, d_ae).fit_transform(X_ae)
-        return S, X_ae, Y, labels, cost
+        return {
+            "S": S,
+            "X_ae": X_ae,
+            "Y": Y,
+            "labels": labels,
+            "cost": cost
+        }
 
     @staticmethod
     def criterion(X, encoded, decoded, S, l):
