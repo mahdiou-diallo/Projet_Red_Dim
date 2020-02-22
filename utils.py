@@ -121,8 +121,19 @@ class AutoEncoder(nn.Module):
         layers = [fn for layer in layers for fn in layer]
         # add the last layer
         layers += [nn.Linear(ls[n-2], ls[n-1])]
+        # initialize the weights
+        layers = [AutoEncoder.init_weights(layer) for layer in layers]
         # transform to sequential
         return nn.Sequential(*layers)
+
+    @staticmethod
+    @torch.no_grad()
+    def init_weights(m):
+        """Initializes the weights using the Xavier method
+            "Understanding the difficulty of training deep feedforward neural networks" - Glorot, X. & Bengio, Y. (2010)
+        """
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m, gain=nn.init.calculate_gain('relu'))
 
     def forward(self, x):
         enc = self.encoder(x)
@@ -277,9 +288,30 @@ class SparseLLE:
 
 class LambdaScheduler:
 
-    def __init__(self, lambda_base=0, lambda_max=1, shift=0, scaling=1, method='sigmoid'):
-        self.shift = shift
-        self.scaling = scaling
+    def __init__(self, lambda_base=0, lambda_max=1, method='sigmoid', shift=0, scaling=1):
+        """Class that will change lambda during training.
+
+        parameters
+        ----------
+        lambda_base:
+        lambda_max:
+        method: str, the scheduling method
+            `constant`: lambda is always equal to lambda_max  
+            `unitstep`: lambda jumps from lambda_base to lambda_max at n = c0  
+            `sigmoid`: lambda follows the formula 
+                $\lambda = \lambda_{base} + (\lambda_{max} - \lambda_{base})/(1+e^(-c1*(n-c0)))$  
+            `saturation`: follows a function that rises linearly when `n` is in [c0, c1] and is constant otherwise
+
+        c0: int, the first constant. 
+            - for a sigmoid, c0 is the time when the sigmoid is equal to 0.5,
+            - for a saturation function, it is the time when the value starts rising
+            - for a unit step, it is the time lambda jumps from the base to the max value
+
+        c1: int or float, it is the time scaling of the sigmoid (how stretched it is),
+            for a saturation function, it is teh time when the value stops increasing
+        """
+        self.c0 = c0
+        self.c1 = c1
         self.lambda_base = lambda_base
         self.lambda_max = lambda_max
         self.iteration = 0
@@ -287,28 +319,42 @@ class LambdaScheduler:
             self.scheduler = self._sigmoid
         elif method == 'unitstep':
             self.scheduler = self._unitstep
-        elif method == 'const':
+        elif method == 'constant':
             self.scheduler = self._constant
+        elif method == 'saturation':
+            self.scheduler = self._saturation
         else:
             raise ValueError(f"No scheduling method: {method!r}")
-
-    def _sigmoid(self, n):
-        """
-        sigmoid = l_min + L/(1+sc*e^(-n+n0))
-        """
-        return self.lambda_base + (self.lambda_max - self.lambda_base) / (1 + np.exp(-self.scaling * (n-self.shift)))
-
-    def _unitstep(self, n):
-        return self.lambda_base if n < self.shift else self.lambda_max
-
-    def _constant(self, n):
-        return self.lambda_max
 
     def step(self):
         self.iteration += 1
 
     def get_l(self):
         return self.scheduler(self.iteration)
+
+    # Scheduling functions
+
+    def _sigmoid(self, n):
+        """
+        sigmoid = l_min + L/(1+sc*e^(-n+n0))
+        self.c0 -> shift
+        self.c1 -> scaling
+        """
+        return self.lambda_base + (self.lambda_max - self.lambda_base) / (1 + np.exp(-self.c1 * (n-self.c0)))
+
+    def _unitstep(self, n):
+        return self.lambda_base if n < self.c0 else self.lambda_max
+
+    def _constant(self, n):
+        return self.lambda_max
+
+    def _saturation(self, n):
+        if n < self.c0:
+            return self.lambda_base
+        if n > self.c1:
+            return self.lambda_max
+        m = (self.lambda_max - self.lambda_base)/(self.c1-self.c0)
+        return self.lambda_base + m * (n-self.c0)
 
 
 ##########################################################################
@@ -318,7 +364,7 @@ class LambdaScheduler:
 
 class Trainer:
 
-    def __init__(self, net, loader, dataset, optimizer, n_epochs,
+    def __init__(self, net, loader, dataset, optimizer, n_epochs, eps=1E-4,
                  n_neighbors=9, sparse_lle=False,
                  lambda_scheduler=None, lambda_step='iter'):
         self.net = net
@@ -333,6 +379,7 @@ class Trainer:
         else:
             self.lambda_scheduler = lambda_scheduler
         self.lambda_step = lambda_step
+        self.eps = eps
 
     def train_model(self, track_W=False, track_Y=False):
         if track_W:
@@ -350,9 +397,11 @@ class Trainer:
             self.y_camera_ = None
 
         self.losses = []
+        prev_loss = -np.Inf
         # loop over the dataset multiple times
         for epoch in tqdm(range(self.n_epochs)):
-
+            cur_loss = 0
+            it = 0
             for inputs, labels in self.loader:
 
                 # encode
@@ -385,6 +434,14 @@ class Trainer:
                                  c=color, cmap='Set1')
                     self.y_camera_.snap()
 
+                cur_loss += cost.item()
+                it += 1
+
+            cur_loss = cur_loss/it
+            if abs((cur_loss - prev_loss)/prev_loss) < self.eps:
+                break
+            prev_loss = cur_loss
+
             if self.lambda_step == 'batch':
                 self.lambda_scheduler.step()
 
@@ -393,29 +450,20 @@ class Trainer:
         if track_Y:
             plt.close(y_fig)
 
-    def predict(self, loader, lle=True):
+    def transform(self, X=None, lle=True):
         with torch.no_grad():
-            n = len(self.dataset)
+            if X is None:
+                X = self.dataset.X
+            else:
+                if isinstance(X, np.ndarray):
+                    X = torch.tensor(X, dtype=torch.float)
+
             d_ae = self.net.d_latent
             d_in = self.net.d_in
 
-            X_ae = np.empty((n, d_ae))
-            batch_size = self.loader.batch_size
-            labels = np.empty(n)
+            inputs = torch.tensor(X, dtype=torch.float)
+            X_ae = self.net(inputs)
 
-            X = np.empty((n, d_in))
-
-            for i, (inputs, outputs) in enumerate(loader):
-                x, _ = self.net(inputs)
-                x = x.numpy()
-                s = i*batch_size
-                e = min((i+1)*batch_size, n)
-                X[s:e, :] = inputs.numpy()
-                X_ae[s:e, :] = x
-                out = outputs.numpy().ravel()
-                if i == 0:
-                    labels = labels.astype(out.dtype)
-                labels[s:e] = out
             if lle:
                 S, Y = self.LLE(self.n_neighbors, d_ae).fit_transform(X_ae)
                 inp = torch.tensor(X, dtype=torch.float)
@@ -426,12 +474,10 @@ class Trainer:
                 S = Y = None
                 cost = None
 
-#             Y = LocallyLinearEmbedding(self.n_neighbors, d_ae).fit_transform(X_ae)
         return {
             "S": S,
             "X_ae": X_ae,
             "Y": Y,
-            "labels": labels,
             "cost": cost
         }
 
