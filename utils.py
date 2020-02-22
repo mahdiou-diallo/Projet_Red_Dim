@@ -25,7 +25,7 @@ from matplotlib import animation
 from celluloid import Camera
 
 # visualisation of the weights matrix
-import r1svd
+# import r1svd
 
 ##########################################################################
 # Data Handling
@@ -122,7 +122,7 @@ class AutoEncoder(nn.Module):
         # add the last layer
         layers += [nn.Linear(ls[n-2], ls[n-1])]
         # initialize the weights
-        layers = [AutoEncoder.init_weights(layer) for layer in layers]
+        [AutoEncoder.init_weights(layer) for layer in layers]
         # transform to sequential
         return nn.Sequential(*layers)
 
@@ -133,7 +133,8 @@ class AutoEncoder(nn.Module):
             "Understanding the difficulty of training deep feedforward neural networks" - Glorot, X. & Bengio, Y. (2010)
         """
         if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m, gain=nn.init.calculate_gain('relu'))
+            nn.init.xavier_uniform_(
+                m.weight, gain=nn.init.calculate_gain('relu'))
 
     def forward(self, x):
         enc = self.encoder(x)
@@ -288,7 +289,8 @@ class SparseLLE:
 
 class LambdaScheduler:
 
-    def __init__(self, lambda_base=0, lambda_max=1, method='sigmoid', shift=0, scaling=1):
+    def __init__(self, lambda_base: float = 0, lambda_max: float = 1,
+                 method: str = 'sigmoid', c0: int = 0, c1=1):
         """Class that will change lambda during training.
 
         parameters
@@ -364,7 +366,7 @@ class LambdaScheduler:
 
 class Trainer:
 
-    def __init__(self, net, loader, dataset, optimizer, n_epochs, eps=1E-4,
+    def __init__(self, net, loader, dataset, optimizer, n_epochs, eps=1E-9,
                  n_neighbors=9, sparse_lle=False,
                  lambda_scheduler=None, lambda_step='iter'):
         self.net = net
@@ -382,68 +384,72 @@ class Trainer:
         self.eps = eps
 
     def train_model(self, track_W=False, track_Y=False):
-        if track_W:
+        if track_W and False:
             w_fig, w_ax = plt.subplots()
             self.w_camera_ = Camera(w_fig)
-            r = r1svd.RankOneSvd()
+            # r = r1svd.RankOneSvd()
         else:
             self.y_camera_ = None
 
         if track_Y:
             y_fig, y_ax = plt.subplots()
             self.y_camera_ = Camera(y_fig)
-            r = r1svd.RankOneSvd()
         else:
             self.y_camera_ = None
 
         self.losses = []
         prev_loss = -np.Inf
         # loop over the dataset multiple times
-        for epoch in tqdm(range(self.n_epochs)):
-            cur_loss = 0
-            it = 0
-            for inputs, labels in self.loader:
+        epochs = range(self.n_epochs)
+        with tqdm(total=len(epochs)) as pbar:
+            for epoch in epochs:
+                cur_loss = 0
+                it = 0
+                for inputs, labels in self.loader:
 
-                # encode
-                enc, dec = self.net(inputs)
-                # compute
-                X_enc = enc.detach().numpy()
-                S, _ = self.LLE(self.n_neighbors,
-                                X_enc.shape[1]).fit_transform(X_enc)
+                    # encode
+                    enc, dec = self.net(inputs)
+                    # compute
+                    X_enc = enc.detach().numpy()
+                    S, _ = self.LLE(self.n_neighbors,
+                                    X_enc.shape[1]).fit_transform(X_enc)
 
-                cost = self.criterion(inputs, enc, dec,
-                                      torch.tensor(S, dtype=torch.float),
-                                      l=self.lambda_scheduler.get_l())
-            #     print(f"Loss:\t{cost.item():.3f}")
-                self.losses.append(cost.item())
+                    cost = self.criterion(inputs, enc, dec,
+                                          torch.tensor(S, dtype=torch.float),
+                                          l=self.lambda_scheduler.get_l())
+                #     print(f"Loss:\t{cost.item():.3f}")
+                    self.losses.append(cost.item())
 
-                # update autoencoder weights
-                self.optimizer.zero_grad()
-                cost.backward()
-                self.optimizer.step()
-                if self.lambda_step == 'iter':
+                    # update autoencoder weights
+                    self.optimizer.zero_grad()
+                    cost.backward()
+                    self.optimizer.step()
+                    if self.lambda_step == 'iter':
+                        self.lambda_scheduler.step()
+
+                    if track_W:
+                        tmp = r.fit_transform(np.abs(S))
+                        w_ax.spy(tmp)
+                        self.w_camera_.snap()
+                    if track_Y:
+                        color = labels.detach().numpy().ravel()
+                        y_ax.scatter(X_enc[:, 0], X_enc[:, 1],
+                                     c=color, cmap='Set1')
+                        self.y_camera_.snap()
+
+                    cur_loss += cost.item()
+                    it += 1
+
+                cur_loss = cur_loss/it
+                if abs((cur_loss - prev_loss)/prev_loss) < self.eps:
+                    break
+                prev_loss = cur_loss
+
+                pbar.set_description(f'loss: {cur_loss:.3f}')
+                pbar.update()
+
+                if self.lambda_step == 'batch':
                     self.lambda_scheduler.step()
-
-                if track_W:
-                    tmp = r.fit_transform(np.abs(S))
-                    w_ax.spy(tmp)
-                    self.w_camera_.snap()
-                if track_Y:
-                    color = labels.detach().numpy().ravel()
-                    y_ax.scatter(X_enc[:, 0], X_enc[:, 1],
-                                 c=color, cmap='Set1')
-                    self.y_camera_.snap()
-
-                cur_loss += cost.item()
-                it += 1
-
-            cur_loss = cur_loss/it
-            if abs((cur_loss - prev_loss)/prev_loss) < self.eps:
-                break
-            prev_loss = cur_loss
-
-            if self.lambda_step == 'batch':
-                self.lambda_scheduler.step()
 
         if track_W:
             plt.close(w_fig)
@@ -453,21 +459,21 @@ class Trainer:
     def transform(self, X=None, lle=True):
         with torch.no_grad():
             if X is None:
-                X = self.dataset.X
+                X = self.dataset.X.numpy()
             else:
-                if isinstance(X, np.ndarray):
-                    X = torch.tensor(X, dtype=torch.float)
+                if isinstance(X, torch.Tensor):
+                    X = X.numpy()
 
             d_ae = self.net.d_latent
             d_in = self.net.d_in
 
             inputs = torch.tensor(X, dtype=torch.float)
-            X_ae = self.net(inputs)
+            enc, dec = self.net(inputs)
 
             if lle:
-                S, Y = self.LLE(self.n_neighbors, d_ae).fit_transform(X_ae)
+                S, Y = self.LLE(self.n_neighbors,
+                                d_ae).fit_transform(enc.numpy())
                 inp = torch.tensor(X, dtype=torch.float)
-                enc, dec = self.net(inp)
                 cost = Trainer.criterion(X, enc.numpy(), dec.numpy(), S,
                                          l=self.lambda_scheduler.get_l())
             else:
@@ -476,7 +482,7 @@ class Trainer:
 
         return {
             "S": S,
-            "X_ae": X_ae,
+            "X_ae": enc,
             "Y": Y,
             "cost": cost
         }
