@@ -171,7 +171,7 @@ def get_neighbors(X, k):
     # neighborhood = np.argpartition(dists, self.k+1, axis=1)[:, :self.k]
 
 
-class LLE:
+class LLE:  # TODO: numerical optimizations using https://scipy-lectures.org/advanced/optimizing/index.html
     def __init__(self, n_neighbors=5, d=2, reg=1E-3):
         self.reg = reg
         self.k = n_neighbors
@@ -196,20 +196,22 @@ class LLE:
             trace = float(C.trace())
             C.flat[::self.k+1] += self.reg * trace if trace > 0 else self.reg
 
-    #         W[i, nbrs] = LA.pinv(C) @ ones
-            W[i, nbrs] = LA.solve(C, ones)
+            # sym_pos improves performance by up to 40%
+            W[i, nbrs] = LA.solve(C, ones, sym_pos=True)
 
     #     print(np.round(W, 2))
         W = W / W.sum(axis=1)[:, np.newaxis]
         self.S_ = W.copy()
+        tmp = W.copy()
 
         # Step 3: compute the embedding from the eigenvectors
         W.flat[::W.shape[0]+1] -= 1  # W - I
-        # calculate the embeddings
-        u, w, v = LA.svd(W)
+        M = W.T @ W
+        # print('M fortran', M.flags.f_contiguous)
 
-        idx = np.argsort(w)[1:(self.d+1)]
-        Y = v.T[:, idx]  # * n**.5
+        w, v = LA.eigh(M, eigvals=(1, self.d), overwrite_a=True)
+        idx = np.argsort(w)
+        Y = v[:, idx]
 
         self.B_ = Y
 
@@ -220,7 +222,7 @@ class LLE:
         return self.S_, self.B_
 
 
-class SparseLLE:
+class SparseLLE:  # BUG: unstable need to correct
     def __init__(self, n_neighbors=5, d=2, reg=1E-3):
         self.reg = reg
         self.k = n_neighbors
@@ -256,7 +258,6 @@ class SparseLLE:
             cols[s:e] = nbrs
 
         W = sps.csr_matrix((vals, (rows, cols)), shape=(n, n))
-    #     print(np.round(W.toarray(), 2))
 
         w_sum = W.sum(axis=1).A.ravel()
         w_sum_inv = sps.diags(1/w_sum)
@@ -267,16 +268,13 @@ class SparseLLE:
 
         # Step 3: compute the embedding from the eigenvectors
         I = sps.eye(n)
-        W = W - I
-        # calculate the embeddings
-        u, w, v = sps.linalg.svds(W, k=n-1, which='LM')
-    #     u, w, v = LA.svd(W.toarray())
-    #     w, v = sps.linalg.eigsh(W.T @ W, k=d+1, which='SM', sigma=0)
-    #     print(w.shape, v.shape)
-    #     v = v.T
+        W -= I
+        M = (W.T @ W).T
 
-        idx = np.argsort(w)[:self.d]
-        Y = v.T[:, idx]  # * n**.5
+        w, v = sps.linalg.eigsh(
+            M, k=self.d+1, which='SM', sigma=0.5, maxiter=1000)
+        idx = np.argsort(w)[1:]
+        Y = v.T[:, idx]
 
         self.B_ = Y
 
@@ -366,7 +364,7 @@ class LambdaScheduler:
 
 class Trainer:
 
-    def __init__(self, net, loader, dataset, optimizer, n_epochs, eps=1E-9,
+    def __init__(self, net, loader, dataset, optimizer, n_epochs, eps=1E-6,
                  n_neighbors=9, sparse_lle=False,
                  lambda_scheduler=None, lambda_step='iter'):
         self.net = net
