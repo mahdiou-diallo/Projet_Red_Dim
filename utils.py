@@ -364,10 +364,11 @@ class LambdaScheduler:
 
 class Trainer:
 
-    def __init__(self, net, loader, dataset, optimizer, n_epochs, eps=1E-6,
+    def __init__(self, net, d_out, loader, dataset, optimizer, n_epochs, eps=1E-6,
                  n_neighbors=9, sparse_lle=False,
                  lambda_scheduler=None, lambda_step='iter'):
         self.net = net
+        self.d_out = d_out
         self.loader = loader
         self.dataset = dataset
         self.optimizer = optimizer
@@ -410,7 +411,7 @@ class Trainer:
                     # compute
                     X_enc = enc.detach().numpy()
                     S, _ = self.LLE(self.n_neighbors,
-                                    X_enc.shape[1]).fit_transform(X_enc)
+                                    self.d_out).fit_transform(X_enc)
 
                     cost = self.criterion(inputs, enc, dec,
                                           torch.tensor(S, dtype=torch.float),
